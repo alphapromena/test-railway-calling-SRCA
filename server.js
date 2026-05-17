@@ -95,47 +95,45 @@ async function callTelnyxAction(callControlId, action, body = {}, retries = 2) {
 // ============================================================================
 
 /**
- * Convert 8kHz μ-law audio to PCM
+ * ITU G.711 μ-law decoder: one byte → one Int16 PCM sample.
+ * Output is guaranteed in [-32124, 32124], safe for Int16LE.
  */
-function mulaw2pcm(mulawBuffer) {
-  const pcmBuffer = Buffer.alloc(mulawBuffer.length * 2);
-  for (let i = 0; i < mulawBuffer.length; i++) {
-    const byte = mulawBuffer[i];
-    let sign = byte & 0x80;
-    let exponent = (byte >> 4) & 0x0f;
-    let mantissa = byte & 0x0f;
-    let sample = mantissa << (exponent + 3);
-    if (exponent !== 0) sample |= 0x0100 << exponent;
-    if (sign === 0) sample = -sample;
-    pcmBuffer.writeInt16LE(sample, i * 2);
-  }
-  return pcmBuffer;
+function mulaw2pcm(muByte) {
+  const BIAS = 0x84;
+  const mu = (~muByte) & 0xFF;
+  const sign = mu & 0x80;
+  const exponent = (mu >> 4) & 0x07;
+  const mantissa = mu & 0x0F;
+  let sample = ((mantissa << 3) + BIAS) << exponent;
+  sample -= BIAS;
+  return sign ? -sample : sample;
 }
 
 /**
- * Convert PCM to 8kHz μ-law audio
+ * ITU G.711 μ-law encoder: one Int16 PCM sample → one μ-law byte.
  */
-function pcm2mulaw(pcmBuffer) {
-  const mulawBuffer = Buffer.alloc(Math.ceil(pcmBuffer.length / 2));
-  for (let i = 0; i < mulawBuffer.length; i++) {
-    let sample = pcmBuffer.readInt16LE(i * 2);
-    let sign = sample & 0x8000;
-    if (sign !== 0) sample = -sample;
-    let exponent = 7;
-    let mantissa;
-    if (sample >= 256) {
-      exponent = Math.floor(Math.log2(sample / 8));
-      if (exponent > 7) exponent = 7;
-      mantissa = (sample >> (exponent + 3)) & 0x0f;
-    } else {
-      mantissa = sample >> 3;
-    }
-    let byte = (mantissa << 4) | (exponent & 0x0f);
-    if (sign === 0) byte ^= 0x7f;
-    else byte ^= 0xff;
-    mulawBuffer[i] = byte;
+function pcm2mulaw(pcmSample) {
+  const BIAS = 0x84;
+  const CLIP = 32635;
+  let sample = Math.max(-32768, Math.min(32767, pcmSample | 0));
+  let sign = (sample < 0) ? 0x80 : 0x00;
+  if (sample < 0) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  sample += BIAS;
+  let exponent = 7;
+  for (let mask = 0x4000; (sample & mask) === 0 && exponent > 0; mask >>= 1) {
+    exponent--;
   }
-  return mulawBuffer;
+  const mantissa = (sample >> (exponent + 3)) & 0x0F;
+  return (~(sign | (exponent << 4) | mantissa)) & 0xFF;
+}
+
+// G.711 self-test (runs once at module load).
+try {
+  const roundTrip = mulaw2pcm(pcm2mulaw(12345));
+  console.log(`[g711] self-test: 12345 → μ-law → ${roundTrip} (expected ~12345 ±200)`);
+} catch (e) {
+  console.warn('[g711] self-test failed', e.message);
 }
 
 /**
@@ -405,7 +403,15 @@ class CallSession {
   async ingestMulaw(mulawBuffer) {
     if (!mulawBuffer || mulawBuffer.length === 0) return;
 
-    const pcmBuffer = mulaw2pcm(mulawBuffer);
+    const pcmBuffer = Buffer.alloc(mulawBuffer.length * 2);
+    for (let i = 0; i < mulawBuffer.length; i++) {
+      try {
+        pcmBuffer.writeInt16LE(mulaw2pcm(mulawBuffer[i]), i * 2);
+      } catch (e) {
+        console.warn('[mulaw2pcm] skip bad sample', mulawBuffer[i], e.message);
+        pcmBuffer.writeInt16LE(0, i * 2); // silence on error
+      }
+    }
     this.audioBuffer = Buffer.concat([this.audioBuffer, pcmBuffer]);
 
     // VAD path: check for utterance boundary
