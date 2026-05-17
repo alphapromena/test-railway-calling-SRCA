@@ -24,9 +24,71 @@ const MAX_AUDIO_BYTES = 400 * 1024; // 400KB cap on audio payloads forwarded to 
 
 // In-memory call sessions, keyed by Telnyx call_session_id
 const callSessions = new Map();
+// Secondary index: call_control_id → CallSession (so webhook and WS handlers
+// can find each other since webhooks key on call_control_id and the streaming
+// 'start' frame keys on call_session_id).
+const callsByControlId = new Map();
 
 // VAD module (will be lazy-loaded)
 let VAD = null;
+
+// ============================================================================
+// TELNYX CALL CONTROL API
+// ============================================================================
+
+const TELNYX_API_BASE = 'https://api.telnyx.com/v2';
+
+/**
+ * Returns the public hostname (no scheme) Telnyx should call back on.
+ * Throws if neither RAILWAY_PUBLIC_DOMAIN nor PUBLIC_DOMAIN is set.
+ */
+function getPublicDomain() {
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.PUBLIC_DOMAIN;
+  if (!domain) {
+    throw new Error('Public domain not configured (set RAILWAY_PUBLIC_DOMAIN or PUBLIC_DOMAIN)');
+  }
+  return domain;
+}
+
+/**
+ * POST a Call Control action against /v2/calls/{call_control_id}/actions/{action}.
+ * 10s timeout, 2 retries with 500ms backoff. Errors are logged loudly with
+ * status + body so we can debug from Railway logs.
+ */
+async function callTelnyxAction(callControlId, action, body = {}, retries = 2) {
+  if (!TELNYX_API_KEY) {
+    console.error(`[telnyx] ${action} aborted: TELNYX_API_KEY not set`);
+    return null;
+  }
+  if (!callControlId) {
+    console.error(`[telnyx] ${action} aborted: missing call_control_id`);
+    return null;
+  }
+
+  const url = `${TELNYX_API_BASE}/calls/${encodeURIComponent(callControlId)}/actions/${action}`;
+  try {
+    const response = await axios.post(url, body, {
+      headers: {
+        Authorization: `Bearer ${TELNYX_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    });
+    console.log(`[telnyx] ${action} OK (${callControlId.slice(0, 8)}…)`);
+    return response.data;
+  } catch (error) {
+    const status = error.response?.status;
+    const bodyStr = error.response?.data
+      ? JSON.stringify(error.response.data).slice(0, 500)
+      : error.message;
+    console.error(`[telnyx] ${action} FAILED ${status || ''}: ${bodyStr}`);
+    if (retries > 0) {
+      await new Promise(r => setTimeout(r, 500));
+      return callTelnyxAction(callControlId, action, body, retries - 1);
+    }
+    return null;
+  }
+}
 
 // ============================================================================
 // AUDIO UTILITIES (unchanged)
@@ -292,8 +354,9 @@ async function livePoll(code, since) {
 // ============================================================================
 
 class CallSession {
-  constructor(callSessionId, telnyxWs, callerPhone) {
+  constructor(callSessionId, telnyxWs, callerPhone, callControlId = null) {
     this.callSessionId = callSessionId;
+    this.callControlId = callControlId;
     this.callCode = `TELNYX-${callSessionId.slice(0, 6).toUpperCase()}`;
     this.callerPhone = callerPhone || 'unknown';
     this.telnyxWs = telnyxWs;
@@ -304,6 +367,14 @@ class CallSession {
     this.dispatcherCursor = 0;
     this.alive = true;
     this.pollTimer = null;
+    // True once we (or Telnyx) have hung up the call. Set by the webhook
+    // handler on call.hangup so the WS close path knows not to re-issue
+    // /actions/hangup and avoid a 422 on an already-terminated call.
+    this.hungUp = false;
+  }
+
+  attachWebSocket(ws) {
+    this.telnyxWs = ws;
   }
 
   async start() {
@@ -490,6 +561,7 @@ class CallSession {
     });
 
     callSessions.delete(this.callSessionId);
+    if (this.callControlId) callsByControlId.delete(this.callControlId);
   }
 }
 
@@ -498,10 +570,112 @@ class CallSession {
 // ============================================================================
 
 app.post('/voice/webhook', express.json(), (req, res) => {
-  const event = req.body;
-  const type = event?.data?.event_type;
-  console.log('[webhook]', type);
+  // ALWAYS ack fast — Telnyx requires a quick 200 or it will retry / fail the call.
   res.status(200).json({ ok: true });
+
+  const event = req.body?.data;
+  const eventType = event?.event_type;
+  const payload = event?.payload || {};
+  const callControlId = payload.call_control_id;
+  const callSessionId = payload.call_session_id;
+
+  if (!eventType) {
+    console.warn('[webhook] event with no event_type:', JSON.stringify(req.body).slice(0, 300));
+    return;
+  }
+
+  console.log(`[webhook] ${eventType} (cc=${callControlId ? callControlId.slice(0, 8) + '…' : 'n/a'})`);
+
+  // All branches below dispatch async work but never block the HTTP response.
+  switch (eventType) {
+    case 'call.initiated': {
+      console.log(`📞 Incoming call from ${payload.from} to ${payload.to}, call_control_id=${callControlId}`);
+
+      let domain;
+      try {
+        domain = getPublicDomain();
+      } catch (e) {
+        console.error('[webhook] cannot answer call:', e.message);
+        return;
+      }
+
+      // Create the session up front so RING fires before audio arrives and the
+      // WS handler can find the existing session by call_control_id.
+      const sid = callSessionId || callControlId || uuidv4();
+      let session = callsByControlId.get(callControlId) || callSessions.get(sid);
+      if (!session) {
+        session = new CallSession(sid, null, payload.from, callControlId);
+        callSessions.set(sid, session);
+        if (callControlId) callsByControlId.set(callControlId, session);
+        session.start().catch(err => console.error('[webhook] session.start error:', err.message));
+      }
+
+      callTelnyxAction(callControlId, 'answer', {
+        webhook_url: `https://${domain}/voice/webhook`,
+        webhook_url_method: 'POST'
+      }).catch(err => console.error('[webhook] answer dispatch error:', err.message));
+      return;
+    }
+
+    case 'call.answered': {
+      console.log('✅ Call answered, starting media stream');
+
+      let domain;
+      try {
+        domain = getPublicDomain();
+      } catch (e) {
+        console.error('[webhook] cannot start streaming:', e.message);
+        return;
+      }
+
+      // Pass call_control_id through the WS URL so handleTelnyxStream can
+      // attach the WS to the right session even before the 'start' frame.
+      const streamUrl = `wss://${domain}/voice/stream?call_control_id=${encodeURIComponent(callControlId)}`;
+      callTelnyxAction(callControlId, 'streaming_start', {
+        stream_url: streamUrl,
+        stream_track: 'inbound_track',
+        stream_bidirectional_mode: 'rtp',
+        stream_bidirectional_codec: 'PCMU'
+      }).catch(err => console.error('[webhook] streaming_start dispatch error:', err.message));
+      return;
+    }
+
+    case 'call.hangup':
+    case 'call.ended': {
+      console.log(`📴 Call ended: ${payload.hangup_cause || 'n/a'}`);
+      const session = callsByControlId.get(callControlId) || callSessions.get(callSessionId);
+      if (session) {
+        session.hungUp = true;
+        session.end().catch(err => console.error('[webhook] session.end error:', err.message));
+      } else {
+        // No session known — fire the HANGUP notification directly so the
+        // console still gets it.
+        const fallbackCode = callSessionId
+          ? `TELNYX-${callSessionId.slice(0, 6).toUpperCase()}`
+          : 'TELNYX-UNKNOWN';
+        liveSend({
+          code: RING_CHANNEL,
+          from: 'caller',
+          kind: 'system',
+          text: `HANGUP|${fallbackCode}`
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    case 'streaming.started':
+      console.log('🎵 Media stream connected');
+      return;
+
+    case 'streaming.stopped':
+    case 'streaming.failed':
+      console.log(`❌ Media stream issue: ${payload.failure_reason || 'stopped'}`);
+      return;
+
+    default:
+      console.log(`[webhook] unhandled event: ${eventType}`);
+      return;
+  }
 });
 
 // Health/root
@@ -537,6 +711,22 @@ function handleTelnyxStream(ws, request) {
   const connectedAt = Date.now();
   console.log(`[telnyx-ws] connected from ${request.headers['x-forwarded-for'] || 'unknown'}`);
 
+  // Pre-attach by call_control_id from the WS URL (set in streaming_start).
+  try {
+    const reqUrl = new URL(request.url, 'http://localhost');
+    const ccid = reqUrl.searchParams.get('call_control_id');
+    if (ccid) {
+      const existing = callsByControlId.get(ccid);
+      if (existing) {
+        session = existing;
+        session.attachWebSocket(ws);
+        console.log(`[${session.callCode}] WS attached via URL call_control_id`);
+      }
+    }
+  } catch (e) {
+    console.warn('[telnyx-ws] URL parse failed:', e.message);
+  }
+
   ws.on('message', async (data) => {
     let message;
     try {
@@ -548,8 +738,8 @@ function handleTelnyxStream(ws, request) {
 
     const event = message.event || message.type;
 
-    // Telnyx sends a "start" / "connected" frame with call metadata first
-    if (!session && (event === 'start' || event === 'connected' || message.start)) {
+    // Telnyx sends a "start" / "connected" frame with call metadata first.
+    if (event === 'start' || event === 'connected' || message.start) {
       const start = message.start || message;
       const callSessionId =
         start.call_session_id ||
@@ -557,6 +747,11 @@ function handleTelnyxStream(ws, request) {
         message.stream_id ||
         message.streamId ||
         uuidv4();
+      const callControlId =
+        start.call_control_id ||
+        start.callControlId ||
+        message.call_control_id ||
+        null;
       const callerPhone =
         start.from ||
         start.caller_number ||
@@ -564,20 +759,35 @@ function handleTelnyxStream(ws, request) {
         message.from ||
         'unknown';
 
-      session = new CallSession(callSessionId, ws, callerPhone);
-      callSessions.set(callSessionId, session);
-      console.log(`[${session.callCode}] start (caller=${session.callerPhone})`);
-      await session.start();
+      // Prefer an existing session (created by call.initiated webhook).
+      const existing =
+        (callControlId && callsByControlId.get(callControlId)) ||
+        callSessions.get(callSessionId);
+
+      if (existing) {
+        session = existing;
+        session.attachWebSocket(ws);
+        if (callControlId && !session.callControlId) {
+          session.callControlId = callControlId;
+          callsByControlId.set(callControlId, session);
+        }
+        console.log(`[${session.callCode}] WS attached (existing session)`);
+      } else if (!session) {
+        session = new CallSession(callSessionId, ws, callerPhone, callControlId);
+        callSessions.set(callSessionId, session);
+        if (callControlId) callsByControlId.set(callControlId, session);
+        console.log(`[${session.callCode}] start (caller=${session.callerPhone})`);
+        await session.start();
+      }
       return;
     }
 
-    // Media frames carry base64 μ-law payloads
+    // Media frames carry base64 μ-law payloads.
     if (event === 'media' && message.media?.payload) {
-      // If Telnyx never sent a "start" frame (some configs don't), bootstrap
-      // a session from the first media frame's stream_id.
+      // If we still don't have a session, bootstrap from the media frame.
       if (!session) {
         const callSessionId = message.stream_id || message.streamId || uuidv4();
-        session = new CallSession(callSessionId, ws, 'unknown');
+        session = new CallSession(callSessionId, ws, 'unknown', null);
         callSessions.set(callSessionId, session);
         console.log(`[${session.callCode}] start (implicit from media)`);
         await session.start();
@@ -598,7 +808,16 @@ function handleTelnyxStream(ws, request) {
   ws.on('close', async () => {
     const dur = ((Date.now() - connectedAt) / 1000).toFixed(1);
     console.log(`[telnyx-ws] closed after ${dur}s`);
-    if (session) await session.end();
+    if (!session) return;
+
+    // If the call wasn't already torn down via the webhook, tell Telnyx to
+    // hang up. Skip when hungUp is true to avoid 422 on an ended call.
+    if (!session.hungUp && session.callControlId) {
+      session.hungUp = true;
+      callTelnyxAction(session.callControlId, 'hangup', {})
+        .catch(err => console.error('[telnyx-ws] hangup dispatch error:', err.message));
+    }
+    await session.end();
   });
 
   ws.on('error', (error) => {
@@ -611,10 +830,15 @@ function handleTelnyxStream(ws, request) {
 // ============================================================================
 
 server.listen(PORT, () => {
+  let domain = null;
+  try { domain = getPublicDomain(); } catch (_) { /* not configured */ }
+
   console.log(`🚀 SRCA Phone Bridge listening on :${PORT}`);
   console.log(`   bridge: ${SRCA_BRIDGE_URL}`);
   console.log(`   api:    ${SRCA_API_BASE}`);
   console.log(`   media:  ws://localhost:${PORT}/voice/stream`);
+  console.log(`   Telnyx Call Control: ${TELNYX_API_KEY ? '✅ configured' : '❌ TELNYX_API_KEY missing'}`);
+  console.log(`   Public domain (for Telnyx): ${domain || '❌ NOT SET'}`);
 });
 
 process.on('SIGTERM', async () => {
