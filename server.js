@@ -215,64 +215,100 @@ function createWavBuffer(pcmBuffer) {
 // SRCA TRANSLATE API CALLS (translate.nubd.ai)
 // ============================================================================
 
+const STT_MAX_BASE64 = 2_097_152; // ~1.5MB raw audio, console contract
+const TTS_MAX_CHARS = 1000;        // console contract
+
 /**
- * POST WAV → /api/stt. Returns { text, language }.
+ * Retry policy: network errors (no response) and 5xx only. 4xx
+ * (400/401/413/429) is a permanent failure for this request — retrying
+ * just produces a 429 cascade.
  */
-async function speechToText(wavBuffer, retries = 2) {
+function shouldRetry(error) {
+  if (!error.response) return true;            // network / timeout
+  const s = error.response.status;
+  return s >= 500 && s < 600;
+}
+
+function logApiError(endpoint, error) {
+  const status = error.response?.status;
+  let body = error.response?.data;
+  // Axios with responseType:'arraybuffer' returns the error body as a
+  // Buffer — decode to UTF-8 so the log is readable.
+  if (Buffer.isBuffer(body)) {
+    try { body = body.toString('utf8'); } catch (_) { /* leave as is */ }
+  }
+  const bodyStr = typeof body === 'string'
+    ? body.slice(0, 500)
+    : JSON.stringify(body).slice(0, 500);
+  console.error(`[${endpoint}] ${status} body=${bodyStr}`);
+}
+
+/**
+ * POST { audio (base64), audioMime, lang? } → /api/stt.
+ * Returns { text, language } (drops the chunk on oversized payloads).
+ */
+async function speechToText(wavBuffer, langHint = null, retries = 2) {
+  if (!wavBuffer || wavBuffer.length === 0) {
+    console.warn('[STT] Empty audio buffer');
+    return { text: '', language: null };
+  }
+
+  const audioBase64 = wavBuffer.toString('base64');
+  if (audioBase64.length > STT_MAX_BASE64) {
+    console.warn(`[STT] skip oversized chunk: ${audioBase64.length} chars`);
+    return { text: '', language: null };
+  }
+
+  const body = {
+    audio: audioBase64,
+    audioMime: 'audio/wav',
+    ...(langHint ? { lang: langHint } : {})
+  };
+
   try {
-    if (!wavBuffer || wavBuffer.length === 0) {
-      console.warn('[STT] Empty audio buffer');
-      return { text: '', language: null };
-    }
-
-    const form = new FormData();
-    form.append('audio', wavBuffer, { filename: 'audio.wav', contentType: 'audio/wav' });
-
-    const response = await axios.post(`${SRCA_API_BASE}/api/stt`, form, {
-      headers: srcaHeaders(form.getHeaders()),
+    const response = await axios.post(`${SRCA_API_BASE}/api/stt`, body, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-srca-service-token': SRCA_SERVICE_TOKEN
+      },
       timeout: 15000,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity
+      maxBodyLength: 4 * 1024 * 1024
     });
-
     return {
       text: response.data?.text || '',
       language: response.data?.language || null
     };
   } catch (error) {
-    const status = error.response?.status;
-    const body = error.response?.data;
-    const bodyStr = typeof body === 'string'
-      ? body.slice(0, 500)
-      : JSON.stringify(body).slice(0, 500);
-    console.error(`[STT] ${status} body=${bodyStr}`);
-    if (retries > 0) {
+    logApiError('STT', error);
+    if (shouldRetry(error) && retries > 0) {
       await new Promise(r => setTimeout(r, 500));
-      return speechToText(wavBuffer, retries - 1);
+      return speechToText(wavBuffer, langHint, retries - 1);
     }
     return { text: '', language: null };
   }
 }
 
 /**
- * POST { text } → /api/detect-language. Returns language code string.
+ * POST { text } → /api/detect-language. Returns language name string.
+ * Console returns { lang, raw_model_output, latency_ms }.
  */
 async function detectLanguage(text, retries = 2) {
   try {
     const response = await axios.post(
       `${SRCA_API_BASE}/api/detect-language`,
       { text },
-      { timeout: 10000, headers: srcaHeaders() }
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-srca-service-token': SRCA_SERVICE_TOKEN
+        },
+        timeout: 10000
+      }
     );
-    return response.data?.language || 'english';
+    return response.data?.lang || response.data?.language || 'english';
   } catch (error) {
-    const status = error.response?.status;
-    const body = error.response?.data;
-    const bodyStr = typeof body === 'string'
-      ? body.slice(0, 500)
-      : JSON.stringify(body).slice(0, 500);
-    console.error(`[detect-language] ${status} body=${bodyStr}`);
-    if (retries > 0) {
+    logApiError('detect-language', error);
+    if (shouldRetry(error) && retries > 0) {
       await new Promise(r => setTimeout(r, 500));
       return detectLanguage(text, retries - 1);
     }
@@ -281,28 +317,29 @@ async function detectLanguage(text, retries = 2) {
 }
 
 /**
- * POST { text, mode, fromLang, toLang } → /api/translate.
- * Returns { result, confidence }.
+ * POST { mode, text, fromLang, toLang } → /api/translate.
+ * Returns { result, confidence }. fromLang/toLang are lowercase names.
  */
 async function translate(text, fromLang, toLang, retries = 2) {
   try {
     const response = await axios.post(
       `${SRCA_API_BASE}/api/translate`,
-      { text, mode: 'translate', fromLang, toLang },
-      { timeout: 15000, headers: srcaHeaders() }
+      { mode: 'translate', text, fromLang, toLang },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-srca-service-token': SRCA_SERVICE_TOKEN
+        },
+        timeout: 15000
+      }
     );
     return {
       result: response.data?.result || text,
       confidence: response.data?.confidence ?? null
     };
   } catch (error) {
-    const status = error.response?.status;
-    const body = error.response?.data;
-    const bodyStr = typeof body === 'string'
-      ? body.slice(0, 500)
-      : JSON.stringify(body).slice(0, 500);
-    console.error(`[translate] ${status} body=${bodyStr}`);
-    if (retries > 0) {
+    logApiError('translate', error);
+    if (shouldRetry(error) && retries > 0) {
       await new Promise(r => setTimeout(r, 500));
       return translate(text, fromLang, toLang, retries - 1);
     }
@@ -312,24 +349,29 @@ async function translate(text, fromLang, toLang, retries = 2) {
 
 /**
  * POST { text, langCode } → /api/tts. Returns raw MP3 Buffer or null.
+ * text is truncated to TTS_MAX_CHARS to satisfy the console limit.
  */
 async function textToSpeech(text, langCode, retries = 2) {
+  if (!text || !text.trim()) return null;
+  const trimmed = text.slice(0, TTS_MAX_CHARS);
+
   try {
-    if (!text || !text.trim()) return null;
     const response = await axios.post(
       `${SRCA_API_BASE}/api/tts`,
-      { text, langCode },
-      { responseType: 'arraybuffer', timeout: 20000, headers: srcaHeaders() }
+      { text: trimmed, langCode },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-srca-service-token': SRCA_SERVICE_TOKEN
+        },
+        responseType: 'arraybuffer',
+        timeout: 15000
+      }
     );
     return Buffer.from(response.data);
   } catch (error) {
-    const status = error.response?.status;
-    const body = error.response?.data;
-    const bodyStr = typeof body === 'string'
-      ? body.slice(0, 500)
-      : JSON.stringify(body).slice(0, 500);
-    console.error(`[TTS] ${status} body=${bodyStr}`);
-    if (retries > 0) {
+    logApiError('TTS', error);
+    if (shouldRetry(error) && retries > 0) {
       await new Promise(r => setTimeout(r, 500));
       return textToSpeech(text, langCode, retries - 1);
     }
@@ -498,7 +540,7 @@ class CallSession {
       console.log(`[${this.callCode}] flushing utterance (${wavBuffer.length}B wav)`);
 
       // STT
-      const { text: callerText, language: whisperLang } = await speechToText(wavBuffer);
+      const { text: callerText, language: whisperLang } = await speechToText(wavBuffer, this.callerLanguage);
       if (!callerText || !callerText.trim()) {
         console.log(`[${this.callCode}] STT empty — discarding chunk`);
         return;
