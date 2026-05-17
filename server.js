@@ -19,15 +19,17 @@ const PORT = process.env.PORT || 8080;
 const SRCA_BRIDGE_URL = process.env.SRCA_BRIDGE_URL || 'https://srca-live-bridge-production.up.railway.app';
 const SRCA_API_BASE = process.env.SRCA_API_BASE || 'https://translate.nubd.ai';
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
+const RING_CHANNEL = 'SRCA-RING';
+const MAX_AUDIO_BYTES = 400 * 1024; // 400KB cap on audio payloads forwarded to console
 
-// In-memory call sessions
+// In-memory call sessions, keyed by Telnyx call_session_id
 const callSessions = new Map();
 
 // VAD module (will be lazy-loaded)
 let VAD = null;
 
 // ============================================================================
-// UTILITIES
+// AUDIO UTILITIES (unchanged)
 // ============================================================================
 
 /**
@@ -54,7 +56,7 @@ function mulaw2pcm(mulawBuffer) {
 function pcm2mulaw(pcmBuffer) {
   const mulawBuffer = Buffer.alloc(Math.ceil(pcmBuffer.length / 2));
   for (let i = 0; i < mulawBuffer.length; i++) {
-    const sample = pcmBuffer.readInt16LE(i * 2);
+    let sample = pcmBuffer.readInt16LE(i * 2);
     let sign = sample & 0x8000;
     if (sign !== 0) sample = -sample;
     let exponent = 7;
@@ -75,27 +77,24 @@ function pcm2mulaw(pcmBuffer) {
 }
 
 /**
- * Convert MP3 to 8kHz μ-law WAV using ffmpeg
+ * Convert MP3 to 8kHz μ-law payload (raw, no headers) using ffmpeg
  */
 async function mp3ToMulaw(mp3Buffer) {
   const tempMp3 = path.join('/tmp', `${uuidv4()}.mp3`);
   const tempWav = path.join('/tmp', `${uuidv4()}.wav`);
-  
+
   try {
     fs.writeFileSync(tempMp3, mp3Buffer);
-    
-    // Convert MP3 to 8kHz μ-law WAV
+
     await execPromise(
       `ffmpeg -i "${tempMp3}" -acodec pcm_mulaw -ar 8000 -ac 1 -f mulaw "${tempWav}" -y 2>/dev/null`
     );
-    
+
     const mulawBuffer = fs.readFileSync(tempWav);
-    
-    // Remove headers if it's a WAV file (RIFF header is 44 bytes)
+
     if (mulawBuffer.slice(0, 4).toString() === 'RIFF') {
       return mulawBuffer.slice(44);
     }
-    
     return mulawBuffer;
   } finally {
     if (fs.existsSync(tempMp3)) fs.unlinkSync(tempMp3);
@@ -104,510 +103,408 @@ async function mp3ToMulaw(mp3Buffer) {
 }
 
 /**
- * Detect language using SRCA API with retry logic
+ * Build a 8kHz mono 16-bit WAV buffer from raw PCM samples
  */
-async function detectLanguage(text, retries = 2) {
-  try {
-    const response = await axios.post(`${SRCA_API_BASE}/api/detect-language`, { text }, {
-      timeout: 10000
-    });
-    return response.data.language || 'en';
-  } catch (error) {
-    console.error('Language detection error:', error.message);
-    if (retries > 0) {
-      console.log('Retrying language detection...');
-      await new Promise(r => setTimeout(r, 500));
-      return detectLanguage(text, retries - 1);
-    }
-    return 'en'; // Default to English
-  }
+function createWavBuffer(pcmBuffer) {
+  const sampleRate = 8000;
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = pcmBuffer.length;
+  const fileSize = 36 + dataSize;
+
+  const wavBuffer = Buffer.alloc(44 + dataSize);
+
+  wavBuffer.write('RIFF', 0);
+  wavBuffer.writeUInt32LE(fileSize, 4);
+  wavBuffer.write('WAVE', 8);
+
+  wavBuffer.write('fmt ', 12);
+  wavBuffer.writeUInt32LE(16, 16);
+  wavBuffer.writeUInt16LE(1, 20);
+  wavBuffer.writeUInt16LE(numChannels, 22);
+  wavBuffer.writeUInt32LE(sampleRate, 24);
+  wavBuffer.writeUInt32LE(byteRate, 28);
+  wavBuffer.writeUInt16LE(blockAlign, 32);
+  wavBuffer.writeUInt16LE(bitsPerSample, 34);
+
+  wavBuffer.write('data', 36);
+  wavBuffer.writeUInt32LE(dataSize, 40);
+  pcmBuffer.copy(wavBuffer, 44);
+
+  return wavBuffer;
 }
 
-/**
- * Translate text using SRCA API with retry logic
- */
-async function translateText(text, targetLanguage, retries = 2) {
-  try {
-    const response = await axios.post(`${SRCA_API_BASE}/api/translate`, {
-      text,
-      targetLanguage
-    }, {
-      timeout: 10000
-    });
-    return response.data.translation || text;
-  } catch (error) {
-    console.error('Translation error:', error.message);
-    if (retries > 0) {
-      console.log('Retrying translation...');
-      await new Promise(r => setTimeout(r, 500));
-      return translateText(text, targetLanguage, retries - 1);
-    }
-    return text;
-  }
-}
+// ============================================================================
+// SRCA TRANSLATE API CALLS (translate.nubd.ai)
+// ============================================================================
 
 /**
- * Convert speech to text using SRCA API with retry logic
+ * POST WAV → /api/stt. Returns { text, language }.
  */
-async function speechToText(audioBuffer, retries = 2) {
+async function speechToText(wavBuffer, retries = 2) {
   try {
-    if (!audioBuffer || audioBuffer.length === 0) {
-      console.warn('Empty audio buffer provided to STT');
-      return '';
+    if (!wavBuffer || wavBuffer.length === 0) {
+      console.warn('[STT] Empty audio buffer');
+      return { text: '', language: null };
     }
 
     const form = new FormData();
-    form.append('audio', audioBuffer, 'audio.wav');
-    
+    form.append('audio', wavBuffer, { filename: 'audio.wav', contentType: 'audio/wav' });
+
     const response = await axios.post(`${SRCA_API_BASE}/api/stt`, form, {
       headers: form.getHeaders(),
-      timeout: 15000
+      timeout: 15000,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity
     });
-    
-    return response.data.text || '';
+
+    return {
+      text: response.data?.text || '',
+      language: response.data?.language || null
+    };
   } catch (error) {
-    console.error('STT error:', error.message);
+    console.error('[STT] error:', error.response?.status, error.message);
     if (retries > 0) {
-      console.log('Retrying STT...');
       await new Promise(r => setTimeout(r, 500));
-      return speechToText(audioBuffer, retries - 1);
+      return speechToText(wavBuffer, retries - 1);
     }
-    return '';
+    return { text: '', language: null };
   }
 }
 
 /**
- * Convert text to speech using SRCA API with retry logic
+ * POST { text } → /api/detect-language. Returns language code string.
  */
-async function textToSpeech(text, language, retries = 2) {
+async function detectLanguage(text, retries = 2) {
   try {
-    if (!text || text.trim().length === 0) {
-      console.warn('Empty text provided to TTS');
-      return null;
+    const response = await axios.post(
+      `${SRCA_API_BASE}/api/detect-language`,
+      { text },
+      { timeout: 10000 }
+    );
+    return response.data?.language || 'english';
+  } catch (error) {
+    console.error('[detect-language] error:', error.response?.status, error.message);
+    if (retries > 0) {
+      await new Promise(r => setTimeout(r, 500));
+      return detectLanguage(text, retries - 1);
     }
+    return 'english';
+  }
+}
 
+/**
+ * POST { text, mode, fromLang, toLang } → /api/translate.
+ * Returns { result, confidence }.
+ */
+async function translate(text, fromLang, toLang, retries = 2) {
+  try {
+    const response = await axios.post(
+      `${SRCA_API_BASE}/api/translate`,
+      { text, mode: 'translate', fromLang, toLang },
+      { timeout: 15000 }
+    );
+    return {
+      result: response.data?.result || text,
+      confidence: response.data?.confidence ?? null
+    };
+  } catch (error) {
+    console.error('[translate] error:', error.response?.status, error.message);
+    if (retries > 0) {
+      await new Promise(r => setTimeout(r, 500));
+      return translate(text, fromLang, toLang, retries - 1);
+    }
+    return { result: text, confidence: null };
+  }
+}
+
+/**
+ * POST { text, langCode } → /api/tts. Returns raw MP3 Buffer or null.
+ */
+async function textToSpeech(text, langCode, retries = 2) {
+  try {
+    if (!text || !text.trim()) return null;
     const response = await axios.post(
       `${SRCA_API_BASE}/api/tts`,
-      { text, language },
-      { 
-        responseType: 'arraybuffer',
-        timeout: 15000
-      }
+      { text, langCode },
+      { responseType: 'arraybuffer', timeout: 20000 }
     );
-    
     return Buffer.from(response.data);
   } catch (error) {
-    console.error('TTS error:', error.message);
+    console.error('[TTS] error:', error.response?.status, error.message);
     if (retries > 0) {
-      console.log('Retrying TTS...');
       await new Promise(r => setTimeout(r, 500));
-      return textToSpeech(text, language, retries - 1);
+      return textToSpeech(text, langCode, retries - 1);
     }
     return null;
   }
 }
 
+// ============================================================================
+// LIVE-BRIDGE PROTOCOL (browser-caller shape)
+// ============================================================================
+
 /**
- * Send message to SRCA platform via bridge with retry logic
+ * POST /api/live-send. Payload shape is locked to what the console expects:
+ *   { code, from: 'caller'|'dispatcher', text, lang, translation,
+ *     translationLang, audio (base64), audioMime, kind }
+ * Only the fields actually being sent are included.
  */
-async function sendToPlatform(sessionId, messageType, data, retries = 2) {
+async function liveSend(payload, retries = 2) {
   try {
-    await axios.post(`${SRCA_BRIDGE_URL}/api/live-send`, {
-      sessionId,
-      type: messageType,
-      ...data
-    }, {
-      timeout: 5000
+    await axios.post(`${SRCA_BRIDGE_URL}/api/live-send`, payload, {
+      timeout: 8000,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity
     });
   } catch (error) {
-    console.error('Bridge send error:', error.message);
+    console.error('[live-send] error:', error.response?.status, error.message);
     if (retries > 0) {
-      console.log('Retrying bridge send...');
-      await new Promise(r => setTimeout(r, 300));
-      return sendToPlatform(sessionId, messageType, data, retries - 1);
+      await new Promise(r => setTimeout(r, 400));
+      return liveSend(payload, retries - 1);
     }
   }
 }
 
 /**
- * Poll messages from SRCA platform via bridge
+ * GET /api/live-poll?code=XXX&since=N. Returns { messages, cursor }.
  */
-async function pollFromPlatform(sessionId) {
+async function livePoll(code, since) {
   try {
-    const response = await axios.get(`${SRCA_BRIDGE_URL}/api/live-poll?sessionId=${sessionId}`, {
+    const response = await axios.get(`${SRCA_BRIDGE_URL}/api/live-poll`, {
+      params: { code, since: since || 0 },
       timeout: 5000
     });
-    return response.data || [];
+    return {
+      messages: response.data?.messages || [],
+      cursor: response.data?.cursor ?? since ?? 0
+    };
   } catch (error) {
-    // Silently fail on poll errors (expected in some cases)
-    return [];
+    // Silently swallow poll errors — they're expected during transient outages
+    return { messages: [], cursor: since || 0 };
   }
 }
 
 // ============================================================================
-// CALL SESSION MANAGEMENT
+// CALL SESSION
 // ============================================================================
 
 class CallSession {
-  constructor(callId, telnyx_ws) {
-    this.callId = callId;
-    this.sessionId = uuidv4();
-    this.telnyx_ws = telnyx_ws;
-    this.callerLanguage = null; // Detected on first utterance
-    this.audioBuffer = Buffer.alloc(0);
+  constructor(callSessionId, telnyxWs, callerPhone) {
+    this.callSessionId = callSessionId;
+    this.callCode = `TELNYX-${callSessionId.slice(0, 6).toUpperCase()}`;
+    this.callerPhone = callerPhone || 'unknown';
+    this.telnyxWs = telnyxWs;
+    this.callerLanguage = null;
+    this.audioBuffer = Buffer.alloc(0); // accumulated PCM (16-bit, 8kHz)
     this.isVoiceActive = false;
-    this.vad = null;
-    this.transcriptLog = []; // For live transcript
-    this.isProcessing = false; // Prevent concurrent processing
+    this.isProcessing = false;
+    this.dispatcherCursor = 0;
+    this.alive = true;
+    this.pollTimer = null;
   }
 
-  async initialize() {
-    // Initialize VAD if not already loaded
-    if (!VAD) {
+  async start() {
+    // Lazy-load VAD (optional)
+    if (VAD === null) {
       try {
         VAD = require('@ricky0123/vad-node');
+        console.log('[VAD] loaded');
       } catch (e) {
-        console.warn('VAD not available, proceeding without voice activity detection');
-        VAD = null;
+        console.warn('[VAD] not available — falling back to fixed-interval flushes');
+        VAD = false;
       }
     }
 
-    // Notify platform of incoming call
-    await sendToPlatform(this.sessionId, 'incoming-call', {
-      callId: this.callId,
-      timestamp: new Date().toISOString()
+    // Fire ring notification on shared SRCA-RING channel
+    console.log(`[${this.callCode}] RING → ${this.callerPhone}`);
+    await liveSend({
+      code: RING_CHANNEL,
+      from: 'caller',
+      kind: 'system',
+      text: `📞 RING|${this.callCode}|${this.callerPhone}`
     });
+
+    // Start dispatcher poll loop (1s cadence)
+    this.pollTimer = setInterval(() => this.pollDispatcher(), 1000);
   }
 
-  async processAudioChunk(mulawBuffer) {
-    if (!mulawBuffer || mulawBuffer.length === 0) {
-      return;
-    }
+  async ingestMulaw(mulawBuffer) {
+    if (!mulawBuffer || mulawBuffer.length === 0) return;
 
-    // Convert μ-law to PCM for processing
     const pcmBuffer = mulaw2pcm(mulawBuffer);
-
-    // Add to buffer
     this.audioBuffer = Buffer.concat([this.audioBuffer, pcmBuffer]);
 
-    // Check for voice activity (if VAD available)
-    if (VAD && this.audioBuffer.length >= 8000) { // ~1 second at 8kHz
+    // VAD path: check for utterance boundary
+    if (VAD && this.audioBuffer.length >= 8000) {
       try {
         const audioArray = new Float32Array(this.audioBuffer.length / 2);
         for (let i = 0; i < audioArray.length; i++) {
           audioArray[i] = this.audioBuffer.readInt16LE(i * 2) / 32768;
         }
-
         const voiceActivity = await VAD.detect(audioArray);
-
         if (voiceActivity && !this.isVoiceActive) {
           this.isVoiceActive = true;
-          console.log(`[${this.callId}] Voice detected`);
+          console.log(`[${this.callCode}] voice start`);
         } else if (!voiceActivity && this.isVoiceActive) {
           this.isVoiceActive = false;
-          await this.processUtterance();
+          await this.flushUtterance();
+          return;
         }
       } catch (error) {
-        console.error(`[${this.callId}] VAD error:`, error.message);
+        console.error(`[${this.callCode}] VAD error:`, error.message);
       }
     }
 
-    // Fallback: process every ~2 seconds of audio
+    // Fallback: flush every ~2 seconds of audio (16000 bytes of 16-bit @ 8kHz)
     if (this.audioBuffer.length >= 16000) {
-      await this.processUtterance();
+      await this.flushUtterance();
     }
   }
 
-  async processUtterance() {
-    if (this.audioBuffer.length === 0 || this.isProcessing) return;
-
+  async flushUtterance() {
+    if (!this.alive || this.isProcessing || this.audioBuffer.length === 0) return;
     this.isProcessing = true;
 
+    const pcm = this.audioBuffer;
+    this.audioBuffer = Buffer.alloc(0);
+
     try {
-      console.log(`[${this.callId}] Processing utterance (${this.audioBuffer.length} bytes)`);
+      const wavBuffer = createWavBuffer(pcm);
+      console.log(`[${this.callCode}] flushing utterance (${wavBuffer.length}B wav)`);
 
-      // Step 1: Convert PCM to WAV for STT
-      const wavBuffer = this.createWavBuffer(this.audioBuffer);
-
-      // Step 2: Speech-to-text
-      const callerText = await speechToText(wavBuffer);
-      if (!callerText || callerText.trim().length === 0) {
-        console.log(`[${this.callId}] No speech detected in audio`);
-        this.audioBuffer = Buffer.alloc(0);
-        this.isProcessing = false;
+      // STT
+      const { text: callerText, language: whisperLang } = await speechToText(wavBuffer);
+      if (!callerText || !callerText.trim()) {
+        console.log(`[${this.callCode}] STT empty — discarding chunk`);
         return;
       }
+      console.log(`[${this.callCode}] STT: "${callerText}" (whisper guess: ${whisperLang || 'n/a'})`);
 
-      console.log(`[${this.callId}] Caller said: ${callerText}`);
-
-      // Step 3: Detect caller's language (on first utterance)
+      // Confirm/override language on first utterance
       if (!this.callerLanguage) {
-        this.callerLanguage = await detectLanguage(callerText);
-        console.log(`[${this.callId}] Detected language: ${this.callerLanguage}`);
+        const confirmed = await detectLanguage(callerText);
+        this.callerLanguage = confirmed || whisperLang || 'english';
+        console.log(`[${this.callCode}] caller language locked: ${this.callerLanguage}`);
       }
 
-      // Step 4: Translate to Arabic
-      const arabicText = await translateText(callerText, 'ar');
-      console.log(`[${this.callId}] Arabic translation: ${arabicText}`);
-
-      // Step 5: Text-to-speech (Arabic)
-      const arabicAudioMp3 = await textToSpeech(arabicText, 'ar');
-      if (!arabicAudioMp3) {
-        console.error(`[${this.callId}] TTS failed for Arabic`);
-        this.audioBuffer = Buffer.alloc(0);
-        this.isProcessing = false;
-        return;
-      }
-
-      // Step 6: Convert MP3 to 8kHz μ-law
-      let arabicAudioMulaw;
-      try {
-        arabicAudioMulaw = await mp3ToMulaw(arabicAudioMp3);
-      } catch (error) {
-        console.error(`[${this.callId}] Codec conversion failed:`, error.message);
-        this.audioBuffer = Buffer.alloc(0);
-        this.isProcessing = false;
-        return;
-      }
-
-      // Step 7: Send to platform
-      await sendToPlatform(this.sessionId, 'caller-audio-ready', {
+      // Translate → Arabic
+      const { result: arabicText, confidence } = await translate(
         callerText,
-        arabicText,
-        audioBase64: arabicAudioMulaw.toString('base64'),
-        timestamp: new Date().toISOString()
-      });
+        this.callerLanguage,
+        'arabic'
+      );
+      console.log(`[${this.callCode}] AR: "${arabicText}" (conf ${confidence})`);
 
-      // Step 8: Add to transcript log
-      this.transcriptLog.push({
-        speaker: 'caller',
-        original: callerText,
-        translated: arabicText,
-        timestamp: new Date().toISOString()
-      });
+      // Build live-send payload
+      const payload = {
+        code: this.callCode,
+        from: 'caller',
+        text: callerText,
+        lang: this.callerLanguage,
+        translation: arabicText,
+        translationLang: 'arabic'
+      };
 
-      console.log(`[${this.callId}] Utterance processed successfully`);
+      // Attach raw caller audio (real voice) under the size cap
+      if (wavBuffer.length <= MAX_AUDIO_BYTES) {
+        payload.audio = wavBuffer.toString('base64');
+        payload.audioMime = 'audio/wav';
+        console.log(`[${this.callCode}] shipping audio (${wavBuffer.length}B)`);
+      } else {
+        console.log(`[${this.callCode}] audio too large (${wavBuffer.length}B) — text only`);
+      }
 
-      // Clear buffer
-      this.audioBuffer = Buffer.alloc(0);
+      await liveSend(payload);
+      console.log(`[${this.callCode}] → console: caller turn delivered`);
     } catch (error) {
-      console.error(`[${this.callId}] Utterance processing error:`, error.message);
-      this.audioBuffer = Buffer.alloc(0);
+      console.error(`[${this.callCode}] flush error:`, error.message);
     } finally {
       this.isProcessing = false;
     }
   }
 
-  createWavBuffer(pcmBuffer) {
-    const sampleRate = 8000;
-    const numChannels = 1;
-    const bitsPerSample = 16;
-    const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-    const blockAlign = numChannels * (bitsPerSample / 8);
-    const dataSize = pcmBuffer.length;
-    const fileSize = 36 + dataSize;
-
-    const wavBuffer = Buffer.alloc(44 + dataSize);
-
-    // RIFF header
-    wavBuffer.write('RIFF', 0);
-    wavBuffer.writeUInt32LE(fileSize, 4);
-    wavBuffer.write('WAVE', 8);
-
-    // fmt subchunk
-    wavBuffer.write('fmt ', 12);
-    wavBuffer.writeUInt32LE(16, 16); // Subchunk1Size
-    wavBuffer.writeUInt16LE(1, 20); // AudioFormat (1 = PCM)
-    wavBuffer.writeUInt16LE(numChannels, 22);
-    wavBuffer.writeUInt32LE(sampleRate, 24);
-    wavBuffer.writeUInt32LE(byteRate, 28);
-    wavBuffer.writeUInt16LE(blockAlign, 32);
-    wavBuffer.writeUInt16LE(bitsPerSample, 34);
-
-    // data subchunk
-    wavBuffer.write('data', 36);
-    wavBuffer.writeUInt32LE(dataSize, 40);
-    pcmBuffer.copy(wavBuffer, 44);
-
-    return wavBuffer;
+  async pollDispatcher() {
+    if (!this.alive) return;
+    try {
+      const { messages, cursor } = await livePoll(this.callCode, this.dispatcherCursor);
+      if (cursor && cursor !== this.dispatcherCursor) {
+        this.dispatcherCursor = cursor;
+      }
+      for (const msg of messages) {
+        if (msg.from !== 'dispatcher') continue;
+        await this.handleDispatcherMessage(msg);
+      }
+    } catch (error) {
+      console.error(`[${this.callCode}] poll error:`, error.message);
+    }
   }
 
-  async handleDispatcherAudio(audioBase64) {
-    if (!audioBase64 || this.isProcessing) return;
-
+  async handleDispatcherMessage(msg) {
     try {
-      const audioBuffer = Buffer.from(audioBase64, 'base64');
+      let mp3Buffer = null;
 
-      if (audioBuffer.length === 0) {
-        console.warn(`[${this.callId}] Empty dispatcher audio received`);
-        return;
+      if (msg.audio) {
+        console.log(`[${this.callCode}] ← dispatcher audio (${msg.audio.length}B b64)`);
+        mp3Buffer = Buffer.from(msg.audio, 'base64');
+      } else if (msg.text && msg.translation) {
+        console.log(`[${this.callCode}] ← dispatcher text "${msg.translation}" — synthesizing TTS`);
+        mp3Buffer = await textToSpeech(msg.translation, msg.translationLang || this.callerLanguage);
+        if (!mp3Buffer) {
+          console.error(`[${this.callCode}] dispatcher TTS failed`);
+          return;
+        }
+      } else {
+        return; // nothing to play
       }
 
-      // Convert μ-law to PCM
-      const pcmBuffer = mulaw2pcm(audioBuffer);
-
-      // Convert to WAV
-      const wavBuffer = this.createWavBuffer(pcmBuffer);
-
-      // Step 1: Speech-to-text (Arabic)
-      const arabicText = await speechToText(wavBuffer);
-      if (!arabicText || arabicText.trim().length === 0) {
-        console.log(`[${this.callId}] No speech detected in dispatcher audio`);
-        return;
-      }
-
-      console.log(`[${this.callId}] Dispatcher said (Arabic): ${arabicText}`);
-
-      // Step 2: Translate to caller's language
-      if (!this.callerLanguage) {
-        console.warn(`[${this.callId}] Caller language not yet detected`);
-        return;
-      }
-
-      const callerText = await translateText(arabicText, this.callerLanguage);
-      console.log(`[${this.callId}] Translated to ${this.callerLanguage}: ${callerText}`);
-
-      // Step 3: Text-to-speech in caller's language
-      const callerAudioMp3 = await textToSpeech(callerText, this.callerLanguage);
-      if (!callerAudioMp3) {
-        console.error(`[${this.callId}] TTS failed for caller language`);
-        return;
-      }
-
-      // Step 4: Convert MP3 to 8kHz μ-law
-      let callerAudioMulaw;
-      try {
-        callerAudioMulaw = await mp3ToMulaw(callerAudioMp3);
-      } catch (error) {
-        console.error(`[${this.callId}] Codec conversion failed:`, error.message);
-        return;
-      }
-
-      // Step 5: Send audio back through Telnyx
-      if (this.telnyx_ws && this.telnyx_ws.readyState === WebSocket.OPEN) {
-        this.telnyx_ws.send(JSON.stringify({
+      const mulawPayload = await mp3ToMulaw(mp3Buffer);
+      if (this.telnyxWs && this.telnyxWs.readyState === WebSocket.OPEN) {
+        this.telnyxWs.send(JSON.stringify({
           type: 'media',
-          media: {
-            payload: callerAudioMulaw.toString('base64')
-          }
+          media: { payload: mulawPayload.toString('base64') }
         }));
-        console.log(`[${this.callId}] Audio sent back to caller`);
+        console.log(`[${this.callCode}] → caller: played ${mulawPayload.length}B μ-law`);
+      } else {
+        console.warn(`[${this.callCode}] Telnyx WS not open — drop dispatcher audio`);
       }
-
-      // Step 6: Add to transcript log
-      this.transcriptLog.push({
-        speaker: 'dispatcher',
-        original: arabicText,
-        translated: callerText,
-        timestamp: new Date().toISOString()
-      });
     } catch (error) {
-      console.error(`[${this.callId}] Dispatcher audio error:`, error.message);
+      console.error(`[${this.callCode}] dispatcher playback error:`, error.message);
     }
   }
 
   async end() {
-    console.log(`[${this.callId}] Call ended. Transcript:`, this.transcriptLog);
-    callSessions.delete(this.callId);
+    if (!this.alive) return;
+    this.alive = false;
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.pollTimer = null;
+
+    console.log(`[${this.callCode}] HANGUP`);
+    await liveSend({
+      code: RING_CHANNEL,
+      from: 'caller',
+      kind: 'system',
+      text: `HANGUP|${this.callCode}`
+    });
+
+    callSessions.delete(this.callSessionId);
   }
 }
 
 // ============================================================================
-// TELNYX WEBHOOK HANDLER
+// TELNYX WEBHOOK (HTTP) + MEDIA STREAM (WebSocket)
 // ============================================================================
 
 app.post('/voice/webhook', express.json(), (req, res) => {
   const event = req.body;
-  console.log('Telnyx webhook:', event.data?.event_type);
-
+  const type = event?.data?.event_type;
+  console.log('[webhook]', type);
   res.status(200).json({ ok: true });
-
-  if (event.data?.event_type === 'call.initiated') {
-    const callId = event.data.payload?.call_session_id;
-    console.log(`Call initiated: ${callId}`);
-  }
 });
 
-// ============================================================================
-// TELNYX MEDIA STREAMING WEBSOCKET
-// ============================================================================
-
-app.get('/voice/stream', (req, res) => {
-  const callId = req.query.call_session_id;
-
-  if (!callId) {
-    return res.status(400).send('Missing call_session_id');
-  }
-
-  const ws = new WebSocket.Server({ noServer: true });
-
-  server.on('upgrade', (request, socket, head) => {
-    if (request.url.startsWith('/voice/stream')) {
-      ws.handleUpgrade(request, socket, head, (ws) => {
-        handleTelnyxStream(ws, callId);
-      });
-    }
-  });
-
-  res.status(200).send('WebSocket upgrade initiated');
-});
-
-async function handleTelnyxStream(telnyx_ws, callId) {
-  console.log(`[${callId}] Telnyx WebSocket connected`);
-
-  // Create call session
-  const session = new CallSession(callId, telnyx_ws);
-  await session.initialize();
-  callSessions.set(callId, session);
-
-  // Poll for dispatcher audio periodically (less aggressive)
-  const pollInterval = setInterval(async () => {
-    if (!callSessions.has(callId)) {
-      clearInterval(pollInterval);
-      return;
-    }
-
-    try {
-      const messages = await pollFromPlatform(session.sessionId);
-      for (const msg of messages) {
-        if (msg.type === 'dispatcher-audio' && msg.audioBase64) {
-          await session.handleDispatcherAudio(msg.audioBase64);
-        }
-      }
-    } catch (error) {
-      console.error(`[${callId}] Poll error:`, error.message);
-    }
-  }, 1000); // Poll every 1 second (was 500ms)
-
-  telnyx_ws.on('message', async (data) => {
-    try {
-      const message = JSON.parse(data);
-
-      if (message.type === 'media' && message.media?.payload) {
-        // Incoming audio from caller
-        const mulawBuffer = Buffer.from(message.media.payload, 'base64');
-        await session.processAudioChunk(mulawBuffer);
-      }
-    } catch (error) {
-      console.error(`[${callId}] WebSocket message error:`, error.message);
-    }
-  });
-
-  telnyx_ws.on('close', async () => {
-    console.log(`[${callId}] Telnyx WebSocket closed`);
-    clearInterval(pollInterval);
-    await session.end();
-  });
-
-  telnyx_ws.on('error', (error) => {
-    console.error(`[${callId}] WebSocket error:`, error.message);
-  });
-}
-
-// ============================================================================
-// HEALTH CHECK & METRICS
-// ============================================================================
-
+// Health/root
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
@@ -618,24 +515,112 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'healthy' });
+  res.json({ status: 'healthy', activeCalls: callSessions.size });
 });
 
+// WebSocket upgrade: Telnyx connects to wss://.../voice/stream
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  const url = request.url || '';
+  if (url.startsWith('/voice/stream')) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      handleTelnyxStream(ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+function handleTelnyxStream(ws, request) {
+  let session = null;
+  const connectedAt = Date.now();
+  console.log(`[telnyx-ws] connected from ${request.headers['x-forwarded-for'] || 'unknown'}`);
+
+  ws.on('message', async (data) => {
+    let message;
+    try {
+      message = JSON.parse(data.toString());
+    } catch (e) {
+      console.error('[telnyx-ws] bad json:', e.message);
+      return;
+    }
+
+    const event = message.event || message.type;
+
+    // Telnyx sends a "start" / "connected" frame with call metadata first
+    if (!session && (event === 'start' || event === 'connected' || message.start)) {
+      const start = message.start || message;
+      const callSessionId =
+        start.call_session_id ||
+        start.callSessionId ||
+        message.stream_id ||
+        message.streamId ||
+        uuidv4();
+      const callerPhone =
+        start.from ||
+        start.caller_number ||
+        start.callerNumber ||
+        message.from ||
+        'unknown';
+
+      session = new CallSession(callSessionId, ws, callerPhone);
+      callSessions.set(callSessionId, session);
+      console.log(`[${session.callCode}] start (caller=${session.callerPhone})`);
+      await session.start();
+      return;
+    }
+
+    // Media frames carry base64 μ-law payloads
+    if (event === 'media' && message.media?.payload) {
+      // If Telnyx never sent a "start" frame (some configs don't), bootstrap
+      // a session from the first media frame's stream_id.
+      if (!session) {
+        const callSessionId = message.stream_id || message.streamId || uuidv4();
+        session = new CallSession(callSessionId, ws, 'unknown');
+        callSessions.set(callSessionId, session);
+        console.log(`[${session.callCode}] start (implicit from media)`);
+        await session.start();
+      }
+      const mulawBuffer = Buffer.from(message.media.payload, 'base64');
+      await session.ingestMulaw(mulawBuffer);
+      return;
+    }
+
+    if (event === 'stop') {
+      console.log(`[telnyx-ws] stop event`);
+      if (session) await session.end();
+      ws.close();
+      return;
+    }
+  });
+
+  ws.on('close', async () => {
+    const dur = ((Date.now() - connectedAt) / 1000).toFixed(1);
+    console.log(`[telnyx-ws] closed after ${dur}s`);
+    if (session) await session.end();
+  });
+
+  ws.on('error', (error) => {
+    console.error('[telnyx-ws] error:', error.message);
+  });
+}
+
 // ============================================================================
-// SERVER START
+// START
 // ============================================================================
 
 server.listen(PORT, () => {
-  console.log(`🚀 SRCA Phone Bridge running on port ${PORT}`);
-  console.log(`📞 Telnyx webhook: http://localhost:${PORT}/voice/webhook`);
-  console.log(`📡 Media stream: ws://localhost:${PORT}/voice/stream`);
+  console.log(`🚀 SRCA Phone Bridge listening on :${PORT}`);
+  console.log(`   bridge: ${SRCA_BRIDGE_URL}`);
+  console.log(`   api:    ${SRCA_API_BASE}`);
+  console.log(`   media:  ws://localhost:${PORT}/voice/stream`);
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM — closing active sessions');
+  for (const session of callSessions.values()) {
+    try { await session.end(); } catch (e) { /* swallow */ }
+  }
+  server.close(() => process.exit(0));
 });
