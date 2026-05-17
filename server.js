@@ -40,8 +40,12 @@ const callSessions = new Map();
 // 'start' frame keys on call_session_id).
 const callsByControlId = new Map();
 
-// VAD module (will be lazy-loaded)
+// VAD module (lazy-loaded). vadAvailable is set once at first session
+// start; if the installed @ricky0123/vad-node doesn't export a usable
+// detect() function we disable the VAD path entirely and fall back to
+// time-based chunking — avoids per-frame error spam.
 let VAD = null;
+let vadAvailable = false;
 
 // ============================================================================
 // TELNYX CALL CONTROL API
@@ -236,7 +240,12 @@ async function speechToText(wavBuffer, retries = 2) {
       language: response.data?.language || null
     };
   } catch (error) {
-    console.error('[STT] error:', error.response?.status, error.message);
+    const status = error.response?.status;
+    const body = error.response?.data;
+    const bodyStr = typeof body === 'string'
+      ? body.slice(0, 500)
+      : JSON.stringify(body).slice(0, 500);
+    console.error(`[STT] ${status} body=${bodyStr}`);
     if (retries > 0) {
       await new Promise(r => setTimeout(r, 500));
       return speechToText(wavBuffer, retries - 1);
@@ -257,7 +266,12 @@ async function detectLanguage(text, retries = 2) {
     );
     return response.data?.language || 'english';
   } catch (error) {
-    console.error('[detect-language] error:', error.response?.status, error.message);
+    const status = error.response?.status;
+    const body = error.response?.data;
+    const bodyStr = typeof body === 'string'
+      ? body.slice(0, 500)
+      : JSON.stringify(body).slice(0, 500);
+    console.error(`[detect-language] ${status} body=${bodyStr}`);
     if (retries > 0) {
       await new Promise(r => setTimeout(r, 500));
       return detectLanguage(text, retries - 1);
@@ -282,7 +296,12 @@ async function translate(text, fromLang, toLang, retries = 2) {
       confidence: response.data?.confidence ?? null
     };
   } catch (error) {
-    console.error('[translate] error:', error.response?.status, error.message);
+    const status = error.response?.status;
+    const body = error.response?.data;
+    const bodyStr = typeof body === 'string'
+      ? body.slice(0, 500)
+      : JSON.stringify(body).slice(0, 500);
+    console.error(`[translate] ${status} body=${bodyStr}`);
     if (retries > 0) {
       await new Promise(r => setTimeout(r, 500));
       return translate(text, fromLang, toLang, retries - 1);
@@ -304,7 +323,12 @@ async function textToSpeech(text, langCode, retries = 2) {
     );
     return Buffer.from(response.data);
   } catch (error) {
-    console.error('[TTS] error:', error.response?.status, error.message);
+    const status = error.response?.status;
+    const body = error.response?.data;
+    const bodyStr = typeof body === 'string'
+      ? body.slice(0, 500)
+      : JSON.stringify(body).slice(0, 500);
+    console.error(`[TTS] ${status} body=${bodyStr}`);
     if (retries > 0) {
       await new Promise(r => setTimeout(r, 500));
       return textToSpeech(text, langCode, retries - 1);
@@ -387,14 +411,22 @@ class CallSession {
   }
 
   async start() {
-    // Lazy-load VAD (optional)
+    // Lazy-load VAD (optional) — and gate on whether the install actually
+    // exports a callable detect(). Some shipped versions of
+    // @ricky0123/vad-node export the class but not the static detect,
+    // which used to throw "VAD.detect is not a function" on every frame.
     if (VAD === null) {
       try {
         VAD = require('@ricky0123/vad-node');
-        console.log('[VAD] loaded');
+        console.log('[VAD] module loaded');
       } catch (e) {
-        console.warn('[VAD] not available — falling back to fixed-interval flushes');
         VAD = false;
+      }
+      try {
+        if (typeof VAD?.detect === 'function') vadAvailable = true;
+      } catch (_) { /* swallow */ }
+      if (!vadAvailable) {
+        console.warn('[VAD] disabled — VAD.detect not exported by this version of @ricky0123/vad-node; falling back to time-based chunking');
       }
     }
 
@@ -425,8 +457,8 @@ class CallSession {
     }
     this.audioBuffer = Buffer.concat([this.audioBuffer, pcmBuffer]);
 
-    // VAD path: check for utterance boundary
-    if (VAD && this.audioBuffer.length >= 8000) {
+    // VAD path: check for utterance boundary (only when detect() is real)
+    if (vadAvailable && this.audioBuffer.length >= 8000) {
       try {
         const audioArray = new Float32Array(this.audioBuffer.length / 2);
         for (let i = 0; i < audioArray.length; i++) {
@@ -441,8 +473,10 @@ class CallSession {
           await this.flushUtterance();
           return;
         }
-      } catch (error) {
-        console.error(`[${this.callCode}] VAD error:`, error.message);
+      } catch (_) {
+        // Swallow per-frame VAD errors — feature-check at start() already
+        // flipped vadAvailable off when detect() isn't available; any
+        // residual error here would just spam.
       }
     }
 
