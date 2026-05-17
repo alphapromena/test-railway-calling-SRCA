@@ -18,7 +18,18 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 8080;
 const SRCA_BRIDGE_URL = process.env.SRCA_BRIDGE_URL || 'https://srca-live-bridge-production.up.railway.app';
 const SRCA_API_BASE = process.env.SRCA_API_BASE || 'https://translate.nubd.ai';
+const SRCA_SERVICE_TOKEN = process.env.SRCA_SERVICE_TOKEN || '';
+if (!SRCA_SERVICE_TOKEN) {
+  console.warn('[auth] SRCA_SERVICE_TOKEN is not set — outbound /api/* calls will fail with 401');
+}
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
+
+// Build the header set for every outbound call to SRCA_API_BASE. Always
+// includes the shared-secret service token; merges any extras (e.g. the
+// multipart boundary headers from FormData.getHeaders()).
+function srcaHeaders(extra = {}) {
+  return { ...extra, 'x-srca-service-token': SRCA_SERVICE_TOKEN };
+}
 const RING_CHANNEL = 'SRCA-RING';
 const MAX_AUDIO_BYTES = 400 * 1024; // 400KB cap on audio payloads forwarded to console
 
@@ -214,7 +225,7 @@ async function speechToText(wavBuffer, retries = 2) {
     form.append('audio', wavBuffer, { filename: 'audio.wav', contentType: 'audio/wav' });
 
     const response = await axios.post(`${SRCA_API_BASE}/api/stt`, form, {
-      headers: form.getHeaders(),
+      headers: srcaHeaders(form.getHeaders()),
       timeout: 15000,
       maxContentLength: Infinity,
       maxBodyLength: Infinity
@@ -242,7 +253,7 @@ async function detectLanguage(text, retries = 2) {
     const response = await axios.post(
       `${SRCA_API_BASE}/api/detect-language`,
       { text },
-      { timeout: 10000 }
+      { timeout: 10000, headers: srcaHeaders() }
     );
     return response.data?.language || 'english';
   } catch (error) {
@@ -264,7 +275,7 @@ async function translate(text, fromLang, toLang, retries = 2) {
     const response = await axios.post(
       `${SRCA_API_BASE}/api/translate`,
       { text, mode: 'translate', fromLang, toLang },
-      { timeout: 15000 }
+      { timeout: 15000, headers: srcaHeaders() }
     );
     return {
       result: response.data?.result || text,
@@ -289,7 +300,7 @@ async function textToSpeech(text, langCode, retries = 2) {
     const response = await axios.post(
       `${SRCA_API_BASE}/api/tts`,
       { text, langCode },
-      { responseType: 'arraybuffer', timeout: 20000 }
+      { responseType: 'arraybuffer', timeout: 20000, headers: srcaHeaders() }
     );
     return Buffer.from(response.data);
   } catch (error) {
@@ -844,6 +855,7 @@ server.listen(PORT, () => {
   console.log(`   api:    ${SRCA_API_BASE}`);
   console.log(`   media:  ws://localhost:${PORT}/voice/stream`);
   console.log(`   Telnyx Call Control: ${TELNYX_API_KEY ? '✅ configured' : '❌ TELNYX_API_KEY missing'}`);
+  console.log(`    SRCA service token: ${SRCA_SERVICE_TOKEN ? '✅ configured (' + SRCA_SERVICE_TOKEN.length + ' chars)' : '❌ NOT SET'}`);
   console.log(`   Public domain (for Telnyx): ${domain || '❌ NOT SET'}`);
 });
 
