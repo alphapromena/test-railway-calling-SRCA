@@ -217,6 +217,51 @@ function createWavBuffer(pcmBuffer) {
 
 const STT_MAX_BASE64 = 2_097_152; // ~1.5MB raw audio, console contract
 const TTS_MAX_CHARS = 1000;        // console contract
+const SILENCE_THRESHOLD = 250;     // avg abs amplitude — below = skip STT
+
+/**
+ * Mean absolute amplitude of a 16-bit signed LE mono PCM buffer.
+ * Used to drop near-silent chunks before we burn the STT rate-limit.
+ */
+function pcmAverageAmplitude(pcmBuf) {
+  if (!pcmBuf || pcmBuf.length < 2) return 0;
+  let sum = 0;
+  const samples = pcmBuf.length >> 1; // 2 bytes per sample
+  for (let i = 0; i < pcmBuf.length - 1; i += 2) {
+    sum += Math.abs(pcmBuf.readInt16LE(i));
+  }
+  return sum / samples;
+}
+
+// Known Whisper hallucinations seen in production — Whisper produces
+// these strings when fed near-silence or background noise.
+const WHISPER_HALLUCINATIONS = [
+  /\bosho\b/i,
+  /www\.osho\.com/i,
+  /thanks?\s+for\s+watching/i,
+  /subscribe\s+to\s+(my|our|the)\s+channel/i,
+  /please\s+subscribe/i,
+  /like\s+and\s+subscribe/i,
+  /translated?\s+by/i,
+  /transcript(ion|ed)?\s+by/i,
+  /ترجمة\s+(نانسي|قناة)/i,
+  /\.ترجمة\s+/i
+];
+
+function looksHallucinated(text) {
+  if (!text || text.trim().length === 0) return false;
+  return WHISPER_HALLUCINATIONS.some(rx => rx.test(text));
+}
+
+// Cheap counters so we can tune SILENCE_THRESHOLD from Railway logs.
+const sttGateCounters = { gated: 0, sent: 0 };
+setInterval(() => {
+  if (sttGateCounters.gated || sttGateCounters.sent) {
+    console.log(`[stt-gate] last 60s: sent=${sttGateCounters.sent} silenced=${sttGateCounters.gated}`);
+    sttGateCounters.gated = 0;
+    sttGateCounters.sent = 0;
+  }
+}, 60_000);
 
 /**
  * Retry policy: network errors (no response) and 5xx only. 4xx
@@ -276,7 +321,8 @@ async function speechToText(wavBuffer, langHint = null, retries = 2) {
     });
     return {
       text: response.data?.text || '',
-      language: response.data?.language || null
+      language: response.data?.language || null,
+      hallucinated: response.data?.hallucinated === true
     };
   } catch (error) {
     logApiError('STT', error);
@@ -284,7 +330,7 @@ async function speechToText(wavBuffer, langHint = null, retries = 2) {
       await new Promise(r => setTimeout(r, 500));
       return speechToText(wavBuffer, langHint, retries - 1);
     }
-    return { text: '', language: null };
+    return { text: '', language: null, hallucinated: false };
   }
 }
 
@@ -536,13 +582,29 @@ class CallSession {
     this.audioBuffer = Buffer.alloc(0);
 
     try {
+      // Pre-STT silence gate: average absolute amplitude check. Below the
+      // threshold we drop the chunk — Whisper hallucinates on near-silence
+      // (OSHO copyright text, etc.) and we'd just burn the rate-limit.
+      const avg = pcmAverageAmplitude(pcm);
+      if (avg < SILENCE_THRESHOLD) {
+        sttGateCounters.gated++;
+        console.log(`[${this.callCode}] skip silent chunk (avg=${avg.toFixed(0)} < ${SILENCE_THRESHOLD})`);
+        return;
+      }
+
       const wavBuffer = createWavBuffer(pcm);
-      console.log(`[${this.callCode}] flushing utterance (${wavBuffer.length}B wav)`);
+      console.log(`[${this.callCode}] flushing utterance (${wavBuffer.length}B wav, avg=${avg.toFixed(0)})`);
 
       // STT
-      const { text: callerText, language: whisperLang } = await speechToText(wavBuffer, this.callerLanguage);
+      sttGateCounters.sent++;
+      const { text: callerText, language: whisperLang, hallucinated } =
+        await speechToText(wavBuffer, this.callerLanguage);
       if (!callerText || !callerText.trim()) {
         console.log(`[${this.callCode}] STT empty — discarding chunk`);
+        return;
+      }
+      if (hallucinated || looksHallucinated(callerText)) {
+        console.warn(`[${this.callCode}] dropping hallucinated STT: "${callerText.slice(0, 80)}"`);
         return;
       }
       console.log(`[${this.callCode}] STT: "${callerText}" (whisper guess: ${whisperLang || 'n/a'})`);
