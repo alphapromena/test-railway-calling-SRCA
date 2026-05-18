@@ -484,7 +484,7 @@ class CallSession {
     this.callerLanguage = null;
     this.audioBuffer = Buffer.alloc(0); // accumulated PCM (16-bit, 8kHz)
     this.isVoiceActive = false;
-    this.isProcessing = false;
+    this.processingChain = Promise.resolve();   // serial queue
     this.dispatcherCursor = 0;
     this.alive = true;
     this.pollTimer = null;
@@ -576,12 +576,17 @@ class CallSession {
   }
 
   async flushUtterance() {
-    if (!this.alive || this.isProcessing || this.audioBuffer.length === 0) return;
-    this.isProcessing = true;
-
+    if (!this.alive || this.audioBuffer.length === 0) return;
     const pcm = this.audioBuffer;
     this.audioBuffer = Buffer.alloc(0);
+    // Chain this processing after whatever's already pending, so utterances
+    // stay ordered but the buffer flushes on schedule even when STT is slow.
+    this.processingChain = this.processingChain
+      .then(() => this._processUtterance(pcm))
+      .catch(err => console.error(`[${this.callCode}] utterance failed:`, err.message));
+  }
 
+  async _processUtterance(pcm) {
     try {
       // Pre-STT silence gate: average absolute amplitude check. Below the
       // threshold we drop the chunk — Whisper hallucinates on near-silence
@@ -610,17 +615,28 @@ class CallSession {
       }
       console.log(`[${this.callCode}] STT: "${callerText}" (whisper guess: ${whisperLang || 'n/a'})`);
 
-      // Confirm/override language on first utterance
+      // Soft language detection — don't lock on short utterances. A single
+      // phrase like "Allah Hafiz" or "Hello" was enough to lock the wrong
+      // locale and trigger Whisper hallucinations on later turns.
+      let activeLang = this.callerLanguage;
       if (!this.callerLanguage) {
-        const confirmed = await detectLanguage(callerText);
-        this.callerLanguage = confirmed || whisperLang || 'english';
-        console.log(`[${this.callCode}] caller language locked: ${this.callerLanguage}`);
+        const wordCount = callerText.trim().split(/\s+/).length;
+        const detected = await detectLanguage(callerText);
+        const tentativeLang = detected || whisperLang || 'english';
+        if (wordCount >= 4) {
+          this.callerLanguage = tentativeLang;
+          activeLang = tentativeLang;
+          console.log(`[${this.callCode}] caller language locked (long utterance): ${this.callerLanguage}`);
+        } else {
+          activeLang = tentativeLang;
+          console.log(`[${this.callCode}] tentative language: ${tentativeLang} (waiting for longer utterance to confirm)`);
+        }
       }
 
       // Translate → Arabic
       const { result: arabicText, confidence } = await translate(
         callerText,
-        this.callerLanguage,
+        activeLang,
         'arabic'
       );
       console.log(`[${this.callCode}] AR: "${arabicText}" (conf ${confidence})`);
@@ -630,7 +646,7 @@ class CallSession {
         code: this.callCode,
         from: 'caller',
         text: callerText,
-        lang: this.callerLanguage,
+        lang: activeLang,
         translation: arabicText,
         translationLang: 'arabic'
       };
@@ -648,8 +664,6 @@ class CallSession {
       console.log(`[${this.callCode}] → console: caller turn delivered`);
     } catch (error) {
       console.error(`[${this.callCode}] flush error:`, error.message);
-    } finally {
-      this.isProcessing = false;
     }
   }
 
