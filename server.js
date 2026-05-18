@@ -492,6 +492,7 @@ class CallSession {
     // handler on call.hangup so the WS close path knows not to re-issue
     // /actions/hangup and avoid a 422 on an already-terminated call.
     this.hungUp = false;
+    this.streamId = null;
   }
 
   attachWebSocket(ws) {
@@ -688,11 +689,19 @@ class CallSession {
 
       const mulawPayload = await mp3ToMulaw(mp3Buffer);
       if (this.telnyxWs && this.telnyxWs.readyState === WebSocket.OPEN) {
+        if (!this.streamId) {
+          console.warn(`[${this.callCode}] cannot send to caller: stream_id missing (Telnyx will drop the frame)`);
+          return;
+        }
         this.telnyxWs.send(JSON.stringify({
-          type: 'media',
-          media: { payload: mulawPayload.toString('base64') }
+          event: 'media',
+          stream_id: this.streamId,
+          media: {
+            track: 'outbound',
+            payload: mulawPayload.toString('base64')
+          }
         }));
-        console.log(`[${this.callCode}] → caller: played ${mulawPayload.length}B μ-law`);
+        console.log(`[${this.callCode}] → caller: played ${mulawPayload.length}B μ-law (stream=${this.streamId.slice(0, 8)})`);
       } else {
         console.warn(`[${this.callCode}] Telnyx WS not open — drop dispatcher audio`);
       }
@@ -914,6 +923,13 @@ function handleTelnyxStream(ws, request) {
         message.from ||
         'unknown';
 
+      const streamId =
+        message.stream_id ||
+        message.streamId ||
+        start.stream_id ||
+        start.streamId ||
+        null;
+
       // Prefer an existing session (created by call.initiated webhook).
       const existing =
         (callControlId && callsByControlId.get(callControlId)) ||
@@ -933,6 +949,11 @@ function handleTelnyxStream(ws, request) {
         if (callControlId) callsByControlId.set(callControlId, session);
         console.log(`[${session.callCode}] start (caller=${session.callerPhone})`);
         await session.start();
+      }
+
+      if (session && streamId) {
+        session.streamId = streamId;
+        console.log(`[${session.callCode}] captured stream_id=${streamId.slice(0, 8)}...`);
       }
       return;
     }
