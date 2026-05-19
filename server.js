@@ -564,7 +564,7 @@ class CallSession {
           console.log(`[${this.callCode}] voice start`);
         } else if (!voiceActivity && this.isVoiceActive) {
           this.isVoiceActive = false;
-          await this.flushUtterance();
+          this.flushUtterance();
           return;
         }
       } catch (_) {
@@ -576,16 +576,20 @@ class CallSession {
 
     // Fallback: flush every ~2 seconds of audio (16000 bytes of 16-bit @ 8kHz)
     if (this.audioBuffer.length >= 16000) {
-      await this.flushUtterance();
+      this.flushUtterance();
     }
   }
 
-  async flushUtterance() {
+  // تأخذ snapshot للـ buffer فوراً وتـ chain الـ heavy processing على
+  // الـ promise chain. الـ buffer ينفلش بدون انتظار، فالـ utterances اللي
+  // بعدها ما يصير عندها backlog.
+  flushUtterance() {
     if (!this.alive || this.audioBuffer.length === 0) return;
+
     const pcm = this.audioBuffer;
     this.audioBuffer = Buffer.alloc(0);
-    // Chain this processing after whatever's already pending, so utterances
-    // stay ordered but the buffer flushes on schedule even when STT is slow.
+
+    // chain على آخر utterance — بـ يحافظ على ترتيب التسليم للـ console
     this.processingChain = this.processingChain
       .then(() => this._processUtterance(pcm))
       .catch(err => console.error(`[${this.callCode}] utterance failed:`, err.message));
@@ -756,6 +760,11 @@ class CallSession {
     this.alive = false;
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = null;
+
+    // انتظر آخر utterance processing تخلص لضمان تسليمها للـ console
+    try {
+      await this.processingChain;
+    } catch (_) { /* swallow — الـ chain بـ يـ catch errors فردياً */ }
 
     console.log(`[${this.callCode}] HANGUP`);
     await liveSend({
