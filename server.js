@@ -496,6 +496,7 @@ class CallSession {
     this.isVoiceActive = false;
     this.processingChain = Promise.resolve();   // serial queue
     this.dispatcherCursor = 0;
+    this.pollInFlight = false;   // prevents overlapping dispatcher polls
     this.alive = true;
     this.pollTimer = null;
     // True once we (or Telnyx) have hung up the call. Set by the webhook
@@ -542,7 +543,10 @@ class CallSession {
     });
 
     // Start dispatcher poll loop (1s cadence)
-    this.pollTimer = setInterval(() => this.pollDispatcher(), 1000);
+    // Poll every 250ms (was 1000ms) to cut dispatcher→caller reply latency
+    // by ~0.4s average. Safe because pollDispatcher() now has an in-flight
+    // guard preventing overlapping requests.
+    this.pollTimer = setInterval(() => this.pollDispatcher(), 250);
   }
 
   async ingestMulaw(mulawBuffer) {
@@ -717,6 +721,12 @@ class CallSession {
 
   async pollDispatcher() {
     if (!this.alive) return;
+    // Re-entrancy guard: if a previous poll is still in-flight (slow network,
+    // slow dispatcher TTS processing, etc.), skip this tick rather than running
+    // a parallel poll. Two overlapping polls would both fetch the same
+    // dispatcher messages and play them to the caller twice.
+    if (this.pollInFlight) return;
+    this.pollInFlight = true;
     try {
       const { messages, cursor } = await livePoll(this.callCode, this.dispatcherCursor);
       if (cursor && cursor !== this.dispatcherCursor) {
@@ -728,6 +738,8 @@ class CallSession {
       }
     } catch (error) {
       console.error(`[${this.callCode}] poll error:`, error.message);
+    } finally {
+      this.pollInFlight = false;
     }
   }
 
