@@ -574,8 +574,17 @@ class CallSession {
       }
     }
 
-    // Fallback: flush every ~2 seconds of audio (16000 bytes of 16-bit @ 8kHz)
-    if (this.audioBuffer.length >= 16000) {
+    // Fallback: flush every ~2 seconds of audio (32000 bytes = 2s @ 8kHz 16-bit PCM).
+    // Rationale: per-utterance processing (STT ~800ms + translate ~800ms +
+    // liveSend ~200ms ≈ 1.8s) was exceeding the previous 1s flush interval,
+    // causing the async serial queue to accumulate a growing backlog
+    // (observed: chain depth 4+, pipeline delay reaching 38s at the dispatcher
+    // console after ~60s of continuous caller speech).
+    // With a 2s flush interval, processing time stays ≤ flush rate, so the
+    // chain stabilizes at depth 1. Trade-off: caller-side first-utterance
+    // latency increases by ~1s (acceptable given that subsequent utterances
+    // are no longer delayed).
+    if (this.audioBuffer.length >= 32000) {
       this.flushUtterance();
     }
   }
