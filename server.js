@@ -256,9 +256,39 @@ const WHISPER_HALLUCINATIONS = [
   /^\s*(uh\s*huh[\s.,!?]*){2,}\s*$/i
 ];
 
+// Language-agnostic repetition detector. Whisper's signature hallucination
+// on silence / background noise is to output the same short token repeated
+// many times — "thank you thank you thank you" in English, "ٹھیک ٹھیک ٹھیک"
+// in Urdu, "نعم نعم نعم" in Arabic, etc. We catch these by token frequency
+// rather than language-specific regex.
+function hasRepetitionPattern(text) {
+  if (!text || text.trim().length < 6) return false;
+  // Normalize: lowercase, strip ASCII + Arabic + Urdu punctuation, collapse spaces
+  const cleaned = text.toLowerCase()
+    .replace(/[.,!?؟،؛:]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const tokens = cleaned.split(' ').filter(t => t.length >= 2);
+  if (tokens.length < 3) return false;
+  const counts = new Map();
+  for (const t of tokens) counts.set(t, (counts.get(t) || 0) + 1);
+  // Rule 1: a single token appears 3+ times AND covers ≥60% of the message
+  for (const [, count] of counts) {
+    if (count >= 3 && count / tokens.length >= 0.6) return true;
+  }
+  // Rule 2: short messages built entirely from 2 alternating tokens
+  // e.g. "video kvideo video" — catches Whisper's "concatenation" pattern
+  if (tokens.length >= 3 && counts.size <= 2 && tokens.length - counts.size >= 1) {
+    return true;
+  }
+  return false;
+}
+
 function looksHallucinated(text) {
   if (!text || text.trim().length === 0) return false;
-  return WHISPER_HALLUCINATIONS.some(rx => rx.test(text));
+  if (WHISPER_HALLUCINATIONS.some(rx => rx.test(text))) return true;
+  if (hasRepetitionPattern(text)) return true;
+  return false;
 }
 
 // Cheap counters so we can tune SILENCE_THRESHOLD from Railway logs.
@@ -692,6 +722,15 @@ class CallSession {
         'arabic'
       );
       console.log(`[${this.callCode}] AR: "${arabicText}" (conf ${confidence})`);
+
+      // Drop hallucinations that slip past the STT-side filter. A translation
+      // confidence of exactly 0 means the model couldn't make any sense of the
+      // input at all — typically Whisper produced garbage characters from
+      // background noise (e.g. random Kannada glyphs on a silent Urdu call).
+      if (confidence === 0 || confidence === null) {
+        console.warn(`[${this.callCode}] dropping zero-confidence translation: "${arabicText.slice(0, 80)}"`);
+        return;
+      }
 
       // Build live-send payload
       const payload = {
