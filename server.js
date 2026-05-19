@@ -245,7 +245,15 @@ const WHISPER_HALLUCINATIONS = [
   /translated?\s+by/i,
   /transcript(ion|ed)?\s+by/i,
   /ترجمة\s+(نانسي|قناة)/i,
-  /\.ترجمة\s+/i
+  /\.ترجمة\s+/i,
+  // Repeated "thank you" — classic Whisper hallucination on silence.
+  // Matches only when the ENTIRE string is just "thank you" repeated
+  // 2+ times. A normal "Alright. Thank you." passes through because
+  // "Alright" doesn't fit the pattern.
+  /^\s*(thank\s*you[\s.,!?]*){2,}\s*$/i,
+  // Repeated "yeah" / "uh huh" / "okay" — same class of hallucination
+  /^\s*(yeah[\s.,!?]*){3,}\s*$/i,
+  /^\s*(uh\s*huh[\s.,!?]*){2,}\s*$/i
 ];
 
 function looksHallucinated(text) {
