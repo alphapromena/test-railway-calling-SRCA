@@ -482,6 +482,8 @@ class CallSession {
     this.callerPhone = callerPhone || 'unknown';
     this.telnyxWs = telnyxWs;
     this.callerLanguage = null;
+    // Voting state لتحديد اللغة (يمنع الـ lock المبكر على utterances قصيرة)
+    this.languageVotes = [];   // [{ lang: 'english', words: 5 }, ...]
     this.audioBuffer = Buffer.alloc(0); // accumulated PCM (16-bit, 8kHz)
     this.isVoiceActive = false;
     this.processingChain = Promise.resolve();   // serial queue
@@ -493,6 +495,9 @@ class CallSession {
     // /actions/hangup and avoid a 422 on an already-terminated call.
     this.hungUp = false;
     this.streamId = null;
+    // Thresholds للـ language locking
+    this.LANG_LOCK_MIN_WORDS = 8;     // مجموع الكلمات المطلوبة عبر utterances
+    this.LANG_LOCK_RATIO = 2.0;        // الفائز ≥ 2× الـ runner-up
   }
 
   attachWebSocket(ws) {
@@ -615,28 +620,50 @@ class CallSession {
       }
       console.log(`[${this.callCode}] STT: "${callerText}" (whisper guess: ${whisperLang || 'n/a'})`);
 
-      // Soft language detection — don't lock on short utterances. A single
-      // phrase like "Allah Hafiz" or "Hello" was enough to lock the wrong
-      // locale and trigger Whisper hallucinations on later turns.
-      let activeLang = this.callerLanguage;
+      // تحديد اللغة بالـ voting — لا نـ lock حتى يتجمع word-count كافي مع
+      // agreement واضح. الـ Whisper hint بـ يصير بعد الـ lock بس (تجنب الـ bias).
+      let translationLang = this.callerLanguage;   // null لو لسا غير محسوم
+
       if (!this.callerLanguage) {
-        const wordCount = callerText.trim().split(/\s+/).length;
         const detected = await detectLanguage(callerText);
-        const tentativeLang = detected || whisperLang || 'english';
-        if (wordCount >= 4) {
-          this.callerLanguage = tentativeLang;
-          activeLang = tentativeLang;
-          console.log(`[${this.callCode}] caller language locked (long utterance): ${this.callerLanguage}`);
+        const lang = detected || whisperLang || 'english';
+        const words = callerText.trim().split(/\s+/).filter(Boolean).length;
+        this.languageVotes.push({ lang, words });
+
+        // اجمع الـ tallies per language
+        const tallies = {};
+        let totalWords = 0;
+        for (const v of this.languageVotes) {
+          tallies[v.lang] = (tallies[v.lang] || 0) + v.words;
+          totalWords += v.words;
+        }
+
+        // الفائز والـ runner-up
+        const sorted = Object.entries(tallies).sort((a, b) => b[1] - a[1]);
+        const [topLang, topWords] = sorted[0];
+        const runnerUpWords = sorted[1]?.[1] || 0;
+
+        const enoughWords = totalWords >= this.LANG_LOCK_MIN_WORDS;
+        const clearWinner = runnerUpWords === 0 ||
+                            topWords >= runnerUpWords * this.LANG_LOCK_RATIO;
+
+        if (enoughWords && clearWinner) {
+          this.callerLanguage = topLang;
+          translationLang = topLang;
+          console.log(`[${this.callCode}] caller language LOCKED: ${topLang} ` +
+            `(${topWords}/${totalWords} words, beat runner-up ${runnerUpWords})`);
         } else {
-          activeLang = tentativeLang;
-          console.log(`[${this.callCode}] tentative language: ${tentativeLang} (waiting for longer utterance to confirm)`);
+          translationLang = topLang;   // tentative — للترجمة هاي فقط، بدون lock
+          console.log(`[${this.callCode}] language tentative: ${topLang} ` +
+            `(${topWords}/${totalWords} words, need ≥${this.LANG_LOCK_MIN_WORDS}` +
+            ` & ratio ≥${this.LANG_LOCK_RATIO})`);
         }
       }
 
       // Translate → Arabic
       const { result: arabicText, confidence } = await translate(
         callerText,
-        activeLang,
+        translationLang || 'english',
         'arabic'
       );
       console.log(`[${this.callCode}] AR: "${arabicText}" (conf ${confidence})`);
@@ -646,7 +673,7 @@ class CallSession {
         code: this.callCode,
         from: 'caller',
         text: callerText,
-        lang: activeLang,
+        lang: translationLang || 'english',
         translation: arabicText,
         translationLang: 'arabic'
       };
